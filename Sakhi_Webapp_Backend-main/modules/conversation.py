@@ -2,7 +2,30 @@
 from datetime import datetime
 import uuid
 
-from supabase_client import supabase_insert, supabase_select
+from supabase_client import supabase_insert, supabase_select, supabase_delete
+
+
+def _cleanup_old_messages(user_id: str):
+    try:
+        # Fetch timestamps for all messages of this user
+        rows = supabase_select(
+            "sakhi_conversations",
+            select="created_at",
+            filters=f"user_id=eq.{user_id}"
+        )
+        if not rows or not isinstance(rows, list) or len(rows) <= 100:
+            return
+
+        # Sort descending by created_at and find the 100th message's timestamp
+        # messages are stored with isoformat strings
+        sorted_times = sorted([r["created_at"] for r in rows], reverse=True)
+        threshold_time = sorted_times[99]
+
+        # Delete messages older than the threshold time
+        # This will keep exactly 100 messages (or slightly more if multiple have the same timestamp as threshold)
+        supabase_delete("sakhi_conversations", f"user_id=eq.{user_id}&created_at=lt.{threshold_time}")
+    except Exception as e:
+        print(f"Warning: Failed to cleanup old messages for user {user_id}: {e}")
 
 
 def _save_message(user_id: str, message: str, lang: str, message_type: str, chat_id: str | None = None, youtube_link: str | None = None, infographic_url: str | None = None):
@@ -20,7 +43,12 @@ def _save_message(user_id: str, message: str, lang: str, message_type: str, chat
     if infographic_url:
         payload["infographic_url"] = infographic_url
         
-    return supabase_insert("sakhi_conversations", payload)
+    result = supabase_insert("sakhi_conversations", payload)
+    
+    # After saving, cleanup old messages to keep only 100
+    _cleanup_old_messages(user_id)
+    
+    return result
 
 
 def save_user_message(user_id: str, text: str, lang: str = "en"):

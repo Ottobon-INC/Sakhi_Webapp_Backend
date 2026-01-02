@@ -102,3 +102,14 @@ def supabase_rpc(function_name: str, params: Dict[str, Any]):
         return res.data
 
     return res
+
+
+def supabase_delete(table: str, match: str):
+    """
+    match example: "user_id=eq.<id>"
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{match}"
+    resp = requests.delete(url, headers=HEADERS)
+    if resp.status_code >= 300:
+        raise Exception(f"Supabase delete failed: {resp.status_code} - {resp.text}")
+    return resp.json() if resp.text else {}
