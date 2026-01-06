@@ -129,6 +129,7 @@ class KnowledgeHubResponse(BaseModel):
 class ShareType(str, Enum):
     NAMED = "named"
     ANONYMOUS = "anonymous"
+    PUBLIC = "public"
 
 
 class StoryStatus(str, Enum):
@@ -138,15 +139,15 @@ class StoryStatus(str, Enum):
 
 
 class StoryBase(BaseModel):
-    share_type: ShareType
+    share_type: ShareType | None = None
     name: str | None = None
-    city: str = Field(min_length=1)
-    journey_duration: str = Field(min_length=1)
-    challenges: str = Field(min_length=1)
-    emotions: list[str] = Field(min_length=1)
-    treatments: list[str] = Field(min_length=1)
+    city: str | None = None
+    journey_duration: str | None = None
+    challenges: str | None = None
+    emotions: list[str] | None = None
+    treatments: list[str] | None = None
     emotion_description: str | None = None
-    journey_outcome: str = Field(min_length=1)
+    journey_outcome: str | None = None
     more_details: str | None = None
     hope_message: str | None = None
     photo_url: str | None = None
@@ -159,8 +160,7 @@ class StoryBase(BaseModel):
 
     @model_validator(mode='after')
     def check_name_if_named(self):
-        if self.share_type == ShareType.NAMED and not self.name:
-            raise ValueError('name is required when share_type is named')
+        # Validation relaxed for fetching existing data
         return self
 
 
