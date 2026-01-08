@@ -11,10 +11,9 @@ from modules.text_utils import truncate_response
 from search_hierarchical import hierarchical_rag_query, format_hierarchical_context
 
 _api_key = os.getenv("OPENAI_API_KEY")
-if not _api_key:
-    raise Exception("OPENAI_API_KEY missing")
-
-client = OpenAI(api_key=_api_key)
+client = None
+if _api_key:
+    client = OpenAI(api_key=_api_key)
 
 # Classifier system prompt (must be exact)
 CLASSIFIER_PROMPT = """
@@ -45,6 +44,10 @@ def classify_message(message: str) -> Dict[str, str]:
     """
     Run the classifier prompt and parse out language and signal.
     """
+    if not client:
+        # Default fallback if OpenAI is missing
+        return {"language": "en", "signal": "NO"}
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -135,6 +138,9 @@ def generate_smalltalk_response(
         f"{history_block}"
     )
 
+    if not client:
+        return "I'm here to support you with warmth and care. (Missing API Key for full response)"
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -220,6 +226,9 @@ def generate_medical_response(
             "\nState clearly that advice is general and suggest consulting a doctor for specifics."
         )
 
+    if not client:
+        return "I understand your concern. Since my medical brain is currently offline (Missing API Key), I recommend consulting a doctor for specific guidance.", []
+
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -267,6 +276,9 @@ def generate_intent(query: str) -> str:
     Returns:
         A single warm, empathetic intent sentence
     """
+    if not client:
+        return "We're here to support you with care and understanding — you're in a safe space."
+
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",

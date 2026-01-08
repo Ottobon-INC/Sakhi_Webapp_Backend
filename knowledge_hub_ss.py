@@ -69,18 +69,60 @@ class KnowledgeHubResponse(BaseModel):
         from_attributes = True
 
 @app.get("/api/knowledge-hub/", response_model=List[KnowledgeHubResponse], tags=["knowledge-hub"])
-def get_knowledge_hub_items():
-    """Get all knowledge hub items"""
-    response = supabase.table("sakhi_knowledge_hub").select("*").order("published_at", desc=True).execute()
-    return [KnowledgeHubResponse.model_validate(item) for item in response.data]
+def get_knowledge_hub_items(
+    lang: str = "en",
+    life_stage_id: int | None = None,
+    perspective_id: int | None = None,
+    life_stage: int | None = None,
+    perspective: int | None = None,
+    lifeStage: int | None = None,
+    is_featured: bool | None = None,
+    perPage: int = 100,
+    search: str | None = None
+):
+    """Get all knowledge hub items with language support and filtering"""
+    # Support multiple parameter naming conventions
+    ls_id = life_stage_id if life_stage_id is not None else (life_stage if life_stage is not None else lifeStage)
+    p_id = perspective_id if perspective_id is not None else perspective
+    
+    query = supabase.table("sakhi_knowledge_hub").select("*")
+
+    if search:
+        query = query.ilike("title", f"%{search}%")
+    
+    if ls_id is not None:
+        query = query.eq("life_stage_id", ls_id)
+    if p_id is not None:
+        query = query.eq("perspective_id", p_id)
+    if is_featured is not None:
+        query = query.eq("is_featured", is_featured)
+        
+    response = query.order("published_at", desc=True).limit(perPage).execute()
+    
+    items = []
+    for item in response.data:
+        if lang == "te":
+            item["title"] = item.get("title_te") or item.get("title")
+            item["summary"] = item.get("summary_te") or item.get("summary")
+            item["content"] = item.get("content_te") or item.get("content")
+        items.append(KnowledgeHubResponse.model_validate(item))
+        
+    return items
 
 @app.get("/api/knowledge-hub/{slug}", response_model=KnowledgeHubResponse, tags=["knowledge-hub"])
-def get_knowledge_hub_item_by_slug(slug: str):
-    """Get a single knowledge hub item by slug"""
+def get_knowledge_hub_item_by_slug(slug: str, lang: str = "en"):
+    """Get a single knowledge hub item by slug with language support"""
     response = supabase.table("sakhi_knowledge_hub").select("*").eq("slug", slug).limit(1).execute()
     if not response.data:
         raise HTTPException(status_code=404, detail="Knowledge Hub item not found")
-    return KnowledgeHubResponse.model_validate(response.data[0])
+    
+    item = response.data[0]
+    if lang == "te":
+        item["title"] = item.get("title_te") or item.get("title")
+        item["summary"] = item.get("summary_te") or item.get("summary")
+        item["content"] = item.get("content_te") or item.get("content")
+        
+    return KnowledgeHubResponse.model_validate(item)
 
 # ================== SUCCESS STORIES ROUTES (INLINE) ==================
 from uuid import UUID

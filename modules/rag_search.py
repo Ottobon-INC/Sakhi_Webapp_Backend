@@ -10,10 +10,9 @@ from supabase_client import supabase_rpc, supabase_insert
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 _api_key = os.getenv("OPENAI_API_KEY")
-if not _api_key:
-    raise Exception("OPENAI_API_KEY missing")
-
-_client = OpenAI(api_key=_api_key)
+_client = None
+if _api_key:
+    _client = OpenAI(api_key=_api_key)
 
 
 def _clean_text(text: str) -> str:
@@ -21,6 +20,8 @@ def _clean_text(text: str) -> str:
 
 
 def _generate_embedding(text: str) -> List[float]:
+    if not _client:
+        raise ValueError("OPENAI_API_KEY missing. Cannot generate embeddings.")
     cleaned = _clean_text(text)
     resp = _client.embeddings.create(model=EMBEDDING_MODEL, input=cleaned)
     return resp.data[0].embedding

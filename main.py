@@ -272,8 +272,6 @@ async def sakhi_chat(req: ChatRequest):
     # Handle possible case variants for location
     current_location = user.get("location") or user.get("Location")
 
-    print(f"DEBUG: User={user_id}, Name={current_name}, Gender={current_gender}, Location={current_location}")
-
     msg = req.message.strip()
 
     # STATE 1: WAITING FOR NAME (User sent Name)
@@ -588,13 +586,6 @@ def onboarding_complete(req: OnboardingCompleteRequest):
     """
     Store completed onboarding answers to parent_profiles table.
     """
-    import traceback
-    
-    print(f"DEBUG: Received onboarding complete request")
-    print(f"DEBUG: user_id={req.user_id}, relationship={req.relationship_type}")
-    print(f"DEBUG: parent_profile_id={req.parent_profile_id}")
-    print(f"DEBUG: answers_json={req.answers_json}")
-    
     if not req.user_id or not req.relationship_type:
         raise HTTPException(
             status_code=400,
@@ -605,14 +596,12 @@ def onboarding_complete(req: OnboardingCompleteRequest):
         # Create or update parent profile
         if req.parent_profile_id:
             # Update existing profile
-            print(f"DEBUG: Updating existing profile")
             profile = update_parent_profile_answers(
                 parent_profile_id=req.parent_profile_id,
                 answers_json=req.answers_json
             )
         else:
             # Create new profile
-            print(f"DEBUG: Creating new profile")
             profile = create_parent_profile(
                 user_id=req.user_id,
                 target_user_id=req.target_user_id,
@@ -620,7 +609,6 @@ def onboarding_complete(req: OnboardingCompleteRequest):
                 answers_json=req.answers_json
             )
         
-        print(f"DEBUG: Success! Profile={profile}")
         return {
             "status": "success",
             "parent_profile_id": profile.get("parent_profile"),
@@ -628,29 +616,67 @@ def onboarding_complete(req: OnboardingCompleteRequest):
         }
         
     except Exception as e:
-        error_trace = traceback.format_exc()
-        print(f"ERROR in onboarding_complete: {e}")
-        print(f"TRACEBACK: {error_trace}")
-        raise HTTPException(status_code=500, detail=f"{str(e)} | Trace: {error_trace[:500]}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ================== KNOWLEDGE HUB ROUTES ==================
 @app.get("/api/knowledge-hub/", response_model=list[KnowledgeHubResponse], tags=["knowledge-hub"])
-def get_knowledge_hub_items():
-    """Get all knowledge hub items"""
+def get_knowledge_hub_items(
+    lang: str = "en",
+    life_stage_id: int | None = None,
+    perspective_id: int | None = None,
+    life_stage: int | None = None,
+    perspective: int | None = None,
+    lifeStage: int | None = None,
+    is_featured: bool | None = None,
+    perPage: int = 100,
+    search: str | None = None
+):
+    """Get all knowledge hub items with language support and filtering"""
     from supabase_client import supabase
-    response = supabase.table("sakhi_knowledge_hub").select("*").order("published_at", desc=True).execute()
-    return [KnowledgeHubResponse.model_validate(item) for item in response.data]
+    query = supabase.table("sakhi_knowledge_hub").select("*")
+    
+    if search:
+        query = query.ilike("title", f"%{search}%")
+    
+    ls_id = life_stage_id if life_stage_id is not None else (life_stage if life_stage is not None else lifeStage)
+    p_id = perspective_id if perspective_id is not None else perspective
+    
+    if ls_id is not None:
+        query = query.eq("life_stage_id", ls_id)
+    if p_id is not None:
+        query = query.eq("perspective_id", p_id)
+    if is_featured is not None:
+        query = query.eq("is_featured", is_featured)
+        
+    response = query.order("published_at", desc=True).limit(perPage).execute()
+    
+    items = []
+    for item in response.data:
+        if lang == "te":
+            item["title"] = item.get("title_te") or item.get("title")
+            item["summary"] = item.get("summary_te") or item.get("summary")
+            item["content"] = item.get("content_te") or item.get("content")
+        items.append(KnowledgeHubResponse.model_validate(item))
+        
+    return items
 
 
 @app.get("/api/knowledge-hub/{slug}", response_model=KnowledgeHubResponse, tags=["knowledge-hub"])
-def get_knowledge_hub_item_by_slug(slug: str):
-    """Get a single knowledge hub item by slug"""
+def get_knowledge_hub_item_by_slug(slug: str, lang: str = "en"):
+    """Get a single knowledge hub item by slug with language support"""
     from supabase_client import supabase
     response = supabase.table("sakhi_knowledge_hub").select("*").eq("slug", slug).limit(1).execute()
     if not response.data:
         raise HTTPException(status_code=404, detail="Knowledge Hub item not found")
-    return KnowledgeHubResponse.model_validate(response.data[0])
+    
+    item = response.data[0]
+    if lang == "te":
+        item["title"] = item.get("title_te") or item.get("title")
+        item["summary"] = item.get("summary_te") or item.get("summary")
+        item["content"] = item.get("content_te") or item.get("content")
+        
+    return KnowledgeHubResponse.model_validate(item)
 
 
 # ================== SUCCESS STORIES ROUTES ==================
