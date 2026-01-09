@@ -165,6 +165,7 @@ class StoryBase(BaseModel):
 
 
 class StoryCreate(StoryBase):
+    model_config = {"extra": "allow"}
     pass
 
 
@@ -657,15 +658,80 @@ def get_knowledge_hub_item_by_slug(slug: str):
 STORIES_TABLE = "sakhi_success_stories"
 
 
-@app.post("/stories/draft", response_model=StoryResponse, status_code=status.HTTP_201_CREATED, tags=["stories"])
+@app.post("/stories/draft", status_code=status.HTTP_201_CREATED, tags=["stories"])
+@app.post("/stories/", status_code=status.HTTP_201_CREATED, tags=["stories"])
 async def create_story_draft(story_in: StoryCreate):
     """Create a new story draft"""
     from supabase_client import supabase
+    from modules.story_generator import process_new_story
+
     data = story_in.model_dump()
-    data["status"] = "pending"
-    data["consent"] = False
+    
+    # ==================== FIELD MAPPING ====================
+    # Frontend Field → DB Column
+    
+    # 1. share_type → always public
+    data["share_type"] = ShareType.PUBLIC
+
+    # 2. emotionDetails → emotion_description
+    if not data.get("emotion_description") and data.get("emotionDetails"):
+        data["emotion_description"] = data.get("emotionDetails")
+
+    # 3. outcome → journey_outcome
+    if not data.get("journey_outcome") and data.get("outcome"):
+        data["journey_outcome"] = data.get("outcome")
+
+    # 4. outcomeDetails → more_details
+    if not data.get("more_details") and data.get("outcomeDetails"):
+        data["more_details"] = data.get("outcomeDetails")
+
+    # 5. messageToOthers → hope_message
+    if not data.get("hope_message") and data.get("messageToOthers"):
+        data["hope_message"] = data.get("messageToOthers")
+
+    # 6. uploadedImage → photo_url
+    if not data.get("photo_url") and data.get("uploadedImage"):
+        data["photo_url"] = data.get("uploadedImage")
+
+    # 7. consent_accepted → consent
+    if "consent_accepted" in data:
+        data["consent"] = bool(data.get("consent_accepted")) or str(data.get("consent_accepted")).lower() == "true"
+    elif "consent" not in data:
+        data["consent"] = False
+
+    # 8. language normalization ("English" → "en")
+    lang = data.get("language", "en")
+    lang_map = {"english": "en", "hindi": "hi", "telugu": "te", "tamil": "ta", "malayalam": "ml", "marathi": "mr", "kannada": "kn", "bengali": "bn"}
+    data["language"] = lang_map.get(str(lang).lower(), lang if len(str(lang)) == 2 else "en")
+
+    # Set defaults
+    data["status"] = "published"
+
+    # ==================== CLEANUP NON-DB FIELDS ====================
+    non_db_fields = [
+        "isAnonymous",
+        "emotionDetails",
+        "outcome",
+        "outcomeDetails",
+        "messageToOthers",
+        "uploadedImage",
+        "consent_accepted",
+        "duration",  # Sometimes sent as alias for journey_duration
+    ]
+    for key in non_db_fields:
+        if key in data:
+            del data[key]
+    
     response = supabase.table(STORIES_TABLE).insert(data).execute()
-    return StoryResponse.model_validate(response.data[0])
+    
+    if response.data:
+        # Generate narrative immediately
+        updated_story = await process_new_story(response.data[0]['id'], response.data[0])
+        story_response = StoryResponse.model_validate(updated_story)
+        return {"message": "Story saved", "data": story_response.model_dump()}
+        
+    story_response = StoryResponse.model_validate(response.data[0])
+    return {"message": "Story saved", "data": story_response.model_dump()}
 
 
 @app.post("/stories/consent", response_model=StoryResponse, tags=["stories"])
