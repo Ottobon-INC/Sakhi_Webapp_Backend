@@ -249,6 +249,15 @@ class ModelGateway:
     
     def __init__(self):
         """Initialize the gateway by computing anchor vectors."""
+        from rag import client
+        if client is None:
+            logger.warning("OPENAI_API_KEY missing. ModelGateway initialized without anchor vectors. decide_route will fail.")
+            self.small_talk_anchor = None
+            self.medical_simple_anchor = None
+            self.medical_complex_anchor = None
+            self.facility_info_anchor = None
+            return
+
         logger.info("Initializing ModelGateway with anchor vectors...")
         
         # Compute mean anchor vectors for each category

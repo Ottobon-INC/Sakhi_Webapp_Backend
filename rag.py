@@ -7,16 +7,17 @@ from openai import OpenAI
 EMBEDDING_MODEL = "text-embedding-3-small"  # 1536 dimensions
 
 _api_key = os.getenv("OPENAI_API_KEY")
-if not _api_key:
-    raise Exception("OPENAI_API_KEY missing")
-
-client = OpenAI(api_key=_api_key)
+client = None
+if _api_key:
+    client = OpenAI(api_key=_api_key)
 
 
 def generate_embedding(text: str):
     """
     Converts text into a 1536-dimensional embedding vector using OpenAI.
     """
+    if not client:
+        raise Exception("OPENAI_API_KEY missing. Cannot generate embeddings.")
     cleaned = text.strip().replace("\n", " ")
 
     resp = client.embeddings.create(
