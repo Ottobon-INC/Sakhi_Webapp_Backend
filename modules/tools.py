@@ -385,7 +385,7 @@ class AmIPregnantRequest(BaseModel):
 
 class AmIPregnantResponse(BaseModel):
     result: str # "VERY_LIKELY", "POSSIBLY", "UNLIKELY", "INCONCLUSIVE"
-    copy: str
+    result_copy: str
     nextGuidance: List[str]
 
 @router.post("/am-i-pregnant", response_model=AmIPregnantResponse)
@@ -397,7 +397,7 @@ def check_pregnancy_probability(req: AmIPregnantRequest):
     if req.q5_test == "POSITIVE":
         return {
             "result": "VERY_LIKELY",
-            "copy": "Based on your positive test result, there is a high chance that you may be pregnant.",
+            "result_copy": "Based on your positive test result, there is a high chance that you may be pregnant.",
             "nextGuidance": ["Consult a doctor to confirm with a blood test/ultrasound", "Start taking prenatal vitamins if you haven't already"]
         }
         
@@ -446,7 +446,7 @@ def check_pregnancy_probability(req: AmIPregnantRequest):
     if req.q1_period == "NOT_SURE" and req.q2_sex == "NOT_SURE":
         return {
             "result": "INCONCLUSIVE", 
-            "copy": "We don’t have enough information yet to be sure.",
+            "result_copy": "We don’t have enough information yet to be sure.",
             "nextGuidance": ["Monitor your cycle for the next few days", "Take a pregnancy test if your period remains absent"]
         }
     
@@ -456,7 +456,7 @@ def check_pregnancy_probability(req: AmIPregnantRequest):
     if score >= 6:
         return {
             "result": "VERY_LIKELY",
-            "copy": "Based on your answers, there is a high chance that you may be pregnant.",
+            "result_copy": "Based on your answers, there is a high chance that you may be pregnant.",
             "nextGuidance": ["Take a home pregnancy test for confirmation", "Consult a doctor"]
         }
         
@@ -466,14 +466,14 @@ def check_pregnancy_probability(req: AmIPregnantRequest):
     if score >= 3:
         return {
             "result": "POSSIBLY",
-            "copy": "There is a possibility of pregnancy, but it may be too early to confirm.",
+            "result_copy": "There is a possibility of pregnancy, but it may be too early to confirm.",
             "nextGuidance": ["Wait 3–5 days and observe symptoms", "Take a pregnancy test if your period doesn't start"]
         }
         
     # Logic for Unlikely
     return {
         "result": "UNLIKELY",
-        "copy": "Pregnancy seems unlikely right now, but bodies can vary.",
+        "result_copy": "Pregnancy seems unlikely right now, but bodies can vary.",
         "nextGuidance": ["Track your next period", "Learn about early signs of pregnancy"]
     }
 

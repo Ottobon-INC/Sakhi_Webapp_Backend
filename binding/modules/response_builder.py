@@ -1,5 +1,6 @@
 # modules/response_builder.py
 import os
+import asyncio
 from typing import List, Optional, Dict, Tuple
 
 import supabase_client  # ensures .env is loaded once
@@ -40,12 +41,11 @@ General Output:
 """
 
 
-def classify_message(message: str) -> Dict[str, str]:
+def _classify_message_sync(message: str) -> Dict[str, str]:
     """
-    Run the classifier prompt and parse out language and signal.
+    Internal synchronous classifier — runs in thread pool, do NOT call from async context directly.
     """
     if not client:
-        # Default fallback if OpenAI is missing
         return {"language": "en", "signal": "NO"}
 
     completion = client.chat.completions.create(
@@ -76,6 +76,16 @@ def classify_message(message: str) -> Dict[str, str]:
         "language": language or "en",
         "signal": signal or "NO",
     }
+
+
+def classify_message(message: str) -> Dict[str, str]:
+    """Synchronous wrapper kept for backward compatibility."""
+    return _classify_message_sync(message)
+
+
+async def classify_message_async(message: str) -> Dict[str, str]:
+    """Async version — runs classifier in thread pool so event loop is not blocked."""
+    return await asyncio.to_thread(_classify_message_sync, message)
 
 
 def _friendly_name(name: Optional[str]) -> Optional[str]:
@@ -265,17 +275,8 @@ Based on the patient's question, generate a single warm, empathetic sentence tha
 IMPORTANT: Output ONLY the intent sentence, nothing else. No quotes, no labels, just the sentence."""
 
 
-def generate_intent(query: str) -> str:
-    """
-    Dynamically generate a warm, empathetic, patient-facing intent description
-    using OpenAI based on the patient's query.
-    
-    Args:
-        query: The patient's message/question
-        
-    Returns:
-        A single warm, empathetic intent sentence
-    """
+def _generate_intent_sync(query: str) -> str:
+    """Internal synchronous intent generator — runs in thread pool."""
     if not client:
         return "We're here to support you with care and understanding — you're in a safe space."
 
@@ -289,12 +290,21 @@ def generate_intent(query: str) -> str:
             temperature=0.7,
             max_tokens=100,
         )
-        
         intent = completion.choices[0].message.content.strip()
-        # Remove any quotes if present
         intent = intent.strip('"\'')
         return intent
-        
-    except Exception as e:
-        # Fallback intent if generation fails
+    except Exception:
         return "We're here to support you with care and understanding — you're in a safe space."
+
+
+def generate_intent(query: str) -> str:
+    """Synchronous wrapper kept for backward compatibility."""
+    return _generate_intent_sync(query)
+
+
+async def generate_intent_async(query: str) -> str:
+    """
+    Async version — runs generate_intent in a thread pool so the event loop
+    is not blocked. Use this from async endpoints.
+    """
+    return await asyncio.to_thread(_generate_intent_sync, query)

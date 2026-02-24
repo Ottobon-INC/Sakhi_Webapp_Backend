@@ -1,11 +1,17 @@
 import time
-from fastapi import FastAPI, HTTPException, UploadFile, File, status, Request
+import asyncio
+import json
+import numpy as np
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, UploadFile, File, status, Request, BackgroundTasks
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 from uuid import UUID
 from enum import Enum
 from datetime import datetime
 import uuid as uuid_module
+import numpy as np
 
 from modules.user_profile import (
     create_user,
@@ -19,23 +25,41 @@ from modules.user_profile import (
     login_user,
 )
 from modules.response_builder import (
-    classify_message,
     generate_medical_response,
     generate_smalltalk_response,
-    generate_intent,
+    get_metadata_async,
+    classify_message_async,
+    generate_intent_async,
+    translate_to_english_async
 )
 from modules.conversation import save_user_message, save_sakhi_message, get_last_messages
+from modules.conversation import save_user_message_async, save_sakhi_message_async, get_last_messages_async
+from modules.user_profile import get_user_profile_async
 from modules.user_answers import save_bulk_answers
 from modules.model_gateway import get_model_gateway, Route
 from modules.slm_client import get_slm_client
 from modules.onboarding_engine import OnboardingRequest, get_next_question
 from modules.parent_profiles import create_parent_profile, update_parent_profile_answers
-from modules.onboarding_engine import OnboardingRequest, get_next_question
-from modules.parent_profiles import create_parent_profile, update_parent_profile_answers
-from search_hierarchical import hierarchical_rag_query, format_hierarchical_context
+from search_hierarchical import hierarchical_rag_query, async_hierarchical_rag_query, format_hierarchical_context
 from modules.tools import router as tools_router
+from supabase_client import get_db_client, close_db_client
+from modules.streaming_utils import sakhi_stream_generator
+from rag import async_generate_embedding
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # STARTUP: Initialize persistent async DB connection pool
+    await get_db_client()
+    print("✅ Async DB pool initialized")
+    yield
+    # SHUTDOWN: Gracefully close pools
+    await close_db_client()
+    await get_slm_client().aclose()
+    print("🔴 Async DB and SLM pools closed")
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Include Tools Router
 app.include_router(tools_router)
@@ -54,7 +78,7 @@ async def log_latency(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
-    print(f"⏱️  WEBAPP LATENCY: {process_time:.2f}s | {request.method} {request.url.path}", flush=True)
+    print(f"🚀 WEBAPP LATENCY: {process_time:.2f}s | Path: {request.url.path}", flush=True)
     return response
 
 # Initialize model gateway and SLM client (singleton instances)
@@ -76,6 +100,7 @@ class ChatRequest(BaseModel):
     phone_number: str | None = None
     message: str
     language: str = "en"
+    stream: bool = False
 
 
 class AnswerItem(BaseModel):
@@ -263,7 +288,8 @@ def login(req: LoginRequest):
 
 
 @app.post("/sakhi/chat")
-async def sakhi_chat(req: ChatRequest):
+async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
+    print(f"📥 Received chat request: user_id={req.user_id}, phone={req.phone_number}, stream={req.stream}", flush=True)
     # 1. Resolve or Create User
     try:
         if req.user_id:
@@ -272,10 +298,10 @@ async def sakhi_chat(req: ChatRequest):
             user = get_user_by_phone(req.phone_number)
     except Exception as e:
         # If it's a UUID format error or similar, treat as user not found
-        logger.warning(f"User resolution failed for {req.user_id or req.phone_number}: {e}")
+        print(f"⚠️  User resolution failed for {req.user_id or req.phone_number}: {e}", flush=True)
         user = None
 
-    # If new user (by phone), create them
+    # If new user, create them (auto-onboarding start)
     if not user:
         if req.phone_number:
             try:
@@ -287,6 +313,28 @@ async def sakhi_chat(req: ChatRequest):
                 }
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Failed to register user: {e}")
+        elif req.user_id:
+            # For webapp users who might use email or custom ID, create a guest record
+            try:
+                from modules.user_profile import create_partial_user
+                # Reuse creation logic but handle user_id instead of phone
+                from supabase_client import supabase_insert, generate_user_id
+                
+                # Use provided user_id if it looks like a UUID or generic ID, else generate new
+                # For now, let's just use what they sent or generate if it's too simple
+                final_id = req.user_id if len(req.user_id) > 5 else generate_user_id()
+                
+                user = {
+                    "user_id": final_id,
+                    "email": req.user_id if "@" in req.user_id else None,
+                    "role": "USER",
+                    "name": "Guest User"
+                }
+                supabase_insert("sakhi_users", user)
+                print(f"✅ Created auto-guest for {req.user_id}", flush=True)
+            except Exception as e:
+                print(f"⚠️  Guest creation failed: {e}", flush=True)
+                raise HTTPException(status_code=500, detail="User not found and guest creation failed")
         else:
              raise HTTPException(status_code=400, detail="user_id or phone_number is required")
 
@@ -340,183 +388,183 @@ async def sakhi_chat(req: ChatRequest):
             "image": "Sakhi_intro.png"
         }
 
-    # 3. Normal Flow
-    try:
-        save_user_message(user_id, req.message, req.language)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save user message: {e}")
+    # 3. Normal Flow — SYNCED WITH WHATSAPP LOGIC
+    t_start = time.time()
 
-    # STEP 0: Decide routing using Model Gateway
-    route = model_gateway.decide_route(req.message)
+    # 3. Normal Flow — ULTRA-PARALLEL LATENCY OPTIMIZATION
+    t_start = time.time()
 
-    # Step 1: classify message
-    try:
-        classification = classify_message(req.message)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to classify message: {e}")
-
-    detected_lang = classification.get("language", req.language)
-    signal = classification.get("signal", "NO")
-
-    # Fetch user name for personalization
-    user_name = None
-    try:
-        profile = get_user_profile(user_id)
-        if profile:
-            user_name = profile.get("name")
-    except Exception:
-        user_name = None
-
-    # Conversation history for both modes
-    history = get_last_messages(user_id, limit=5)
-
-    # ===== ROUTE 1: SLM_DIRECT (Small talk, no RAG) =====
-    if route == Route.SLM_DIRECT:
-        try:
-            final_ans = await slm_client.generate_chat(
-                message=req.message,
-                language=detected_lang,
-                user_name=user_name,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate SLM chat response: {e}")
-        
-        try:
-            save_sakhi_message(user_id, final_ans, detected_lang)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save Sakhi message: {e}")
-        
-        # Generate intent description dynamically
-        intent = generate_intent(req.message)
-        
-        return {
-            "intent": intent,
-            "reply": final_ans,
-            "mode": "general",
-            "language": detected_lang,
-            "route": "slm_direct"
-        }
+    # PHASE 1: Concurrent Discovery (Profile + History + Metadata + Embedding)
+    # We launch everything that doesn't depend on each other.
+    t_phase1_start = time.time()
     
-    # ===== ROUTE 2: SLM_RAG (Simple medical, RAG + SLM) =====
-    elif route == Route.SLM_RAG:
-        # Perform RAG search
-        try:
-            kb_results = hierarchical_rag_query(req.message)
-            context_text = format_hierarchical_context(kb_results)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to perform RAG search: {e}")
+    try:
+        # Step 1: Start tasks that don't need a translated query yet
+        # If the user speaks English, we can start embedding immediately.
+        # If not, we wait for translation in phase 1.
         
-        # Generate response using SLM with context
-        try:
-            final_ans = await slm_client.generate_rag_response(
-                context=context_text,
-                message=req.message,
-                language=detected_lang,
-                user_name=user_name,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate SLM RAG response: {e}")
+        from modules.response_builder import detect_language_rule_based
+        fast_lang = detect_language_rule_based(req.message)
         
-        try:
-            save_sakhi_message(user_id, final_ans, detected_lang)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save Sakhi message: {e}")
+        # Parallel Block A: Shared across all languages
+        discovery_tasks = [
+            get_user_profile_async(user_id),              # [0]
+            get_last_messages_async(user_id, 5),          # [1]
+            save_user_message_async(user_id, req.message, req.language), # [2]
+            get_metadata_async(req.message),              # [3] (Rules-only if English)
+        ]
         
-        # Extract metadata from KB results
-        infographic_url = None
-        youtube_link = None
+        # Fast-Path: If English, we can also start Embedding immediately
+        if fast_lang == "en":
+            discovery_tasks.append(async_generate_embedding(req.message)) # [4]
+        
+        phase1_results = await asyncio.gather(*discovery_tasks, return_exceptions=True)
+        
+        profile   = phase1_results[0] if not isinstance(phase1_results[0], Exception) else None
+        history   = phase1_results[1] if not isinstance(phase1_results[1], Exception) else []
+        meta      = phase1_results[3] if not isinstance(phase1_results[3], Exception) else {"language": req.language, "signal": "NO", "intent": "We are here for you.", "translation": req.message}
+        
+        translated_query = meta["translation"]
+        detected_lang = meta["language"]
+        signal = meta["signal"]
+        intent = meta["intent"]
+        
+        # Determine User Vector
+        if fast_lang == "en" and not isinstance(phase1_results[4], Exception):
+            user_vector = np.array(phase1_results[4])
+        else:
+            # If it wasn't English, we just got the translation, so we embed now
+            # (Stage 1.5 for non-English)
+            user_vector = np.array(await async_generate_embedding(translated_query))
+        
+        t_phase1 = time.time()
+        print(f"  ⏱️  Phase 1 (Discovery + Meta + Embed): {t_phase1 - t_phase1_start:.2f}s", flush=True)
+
+        # PHASE 2: Parallel RAG search + Routing
+        # Now that we have the vector, we run RAG and Routing concurrently.
+        t_phase2_start = time.time()
+        
+        vector_list = user_vector.tolist()
+        kb_results, route = await asyncio.gather(
+            async_hierarchical_rag_query(translated_query, query_vector=vector_list, match_count=2),
+            model_gateway.decide_route_async(translated_query, user_vector=user_vector),
+        )
+        
+        # Override route if signal is YES (Critical/Medical)
+        if signal == "YES":
+            route = Route.OPENAI_RAG
+            print(f"  🚨 SIGNAL YES DETECTED: Forcing route to {route.value}", flush=True)
+
+        t_phase2 = time.time()
+        print(f"  ⏱️  Phase 2 (RAG + Route): {t_phase2 - t_phase2_start:.2f}s → {route.value}", flush=True)
+        print(f"  🚀 Total Pre-gen Latency: {t_phase2 - t_start:.2f}s", flush=True)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Concurrent discovery error: {e}")
+
+    # Extract user name from pre-fetched profile
+    user_name = profile.get("name") if profile else None
+
+    # ===== ROUTE HANDLING =====
+    metadata = {
+        "mode": "general",
+        "language": detected_lang,
+        "route": route.value,
+        "youtube_link": None,
+        "infographic_url": None
+    }
+
+    # Extract user name from pre-fetched profile
+    user_name = profile.get("name") if profile else None
+
+    # ===== ROUTE HANDLING =====
+    metadata = {
+        "mode": "general",
+        "language": detected_lang,
+        "route": route.value,
+        "youtube_link": None,
+        "infographic_url": None
+    }
+
+    # Extract metadata for medical routes
+    if route in [Route.SLM_RAG, Route.OPENAI_RAG]:
+        metadata["mode"] = "medical"
         if kb_results:
             for item in kb_results:
-                if item.get("source_type") == "FAQ":
-                    if item.get("infographic_url"):
-                        infographic_url = item["infographic_url"]
-                    if item.get("youtube_link"):
-                        youtube_link = item["youtube_link"]
-                    if infographic_url or youtube_link:
-                        break
-        
-        # Generate intent description dynamically
-        intent = generate_intent(req.message)
-        
-        response_payload = {
-            "intent": intent,
-            "reply": final_ans,
-            "mode": "medical",
-            "language": detected_lang,
-            "youtube_link": youtube_link,
-            "infographic_url": infographic_url,
-            "route": "slm_rag"
-        }
-        print(f"Response Payload: {response_payload}")
-        return response_payload
-
-    # Keep existing small talk logic as fallback (though routing should handle this)
-    if signal != "YES":
-        # Small-talk mode: no RAG
-        try:
-            final_ans = generate_smalltalk_response(
-                req.message,
-                detected_lang,
-                history,
-                user_name=user_name,
-                store_to_kb=False,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to generate small-talk response: {e}")
-
-        try:
-            save_sakhi_message(user_id, final_ans, detected_lang)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save Sakhi message: {e}")
-
-        return {"reply": final_ans, "mode": "general", "language": detected_lang}
-
-    # ===== ROUTE 3: OPENAI_RAG (Complex medical or default, RAG + GPT-4) =====
-    # Medical mode: RAG
-    try:
-        final_ans, _kb = generate_medical_response(
-            prompt=req.message,
-            target_lang=detected_lang,
-            history=history,
-            user_name=user_name,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate medical response: {e}")
-
-    try:
-        save_sakhi_message(user_id, final_ans, detected_lang)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save Sakhi message: {e}")
-
-    # Extract infographic_url and youtube_link if available in kb_results
-    infographic_url = None
-    youtube_link = None
-
-    if _kb:
-        for item in _kb:
-            if item.get("source_type") == "FAQ":
-                if item.get("infographic_url"):
-                    infographic_url = item["infographic_url"]
-                if item.get("youtube_link"):
-                    youtube_link = item["youtube_link"]
-                # If we found an FAQ match, we likely want to use its metadata
-                if infographic_url or youtube_link:
+                # Extract rich media regardless of source_type (FAQ or DOCUMENT)
+                if item.get("infographic_url") and not metadata["infographic_url"]:
+                    metadata["infographic_url"] = item["infographic_url"]
+                if item.get("youtube_link") and not metadata["youtube_link"]:
+                    metadata["youtube_link"] = item["youtube_link"]
+                
+                # Stop if both are filled
+                if metadata["infographic_url"] and metadata["youtube_link"]:
                     break
+        
+        print(f"DEBUG: Metadata for stream: {metadata}")
 
-    # Generate intent description dynamically
-    intent = generate_intent(req.message)
-    
-    response_payload = {
+    # --- STREAMING FLOW ---
+    if req.stream:
+        if route == Route.SLM_DIRECT:
+            stream_iter = slm_client.stream_generate(req.message, detected_lang, user_name)
+        elif route == Route.SLM_RAG:
+            context_text = format_hierarchical_context(kb_results)[:1500]
+            stream_iter = slm_client.stream_rag_response(context_text, req.message, detected_lang, user_name)
+        else: # OPENAI_RAG or fallback
+            # Note: OpenAI streaming would need separate implementation in response_builder
+            # For now, we'll fall back to non-streaming for OpenAI or simulate it
+            # To keep this PR focused, we'll use a simple generator for OpenAI if not already async streamable
+            async def openai_fallback_stream():
+                ans, _ = await generate_medical_response(req.message, detected_lang, history, user_name, kb_results)
+                yield ans
+            stream_iter = openai_fallback_stream()
+
+        # Add background task to save the message after streaming finishes
+        # This is tricky with StreamingResponse, but we can wrap it in the generator
+        async def wrap_generator_with_logging(gen):
+            full_ans = ""
+            async for chunk_json in gen:
+                # Chunk is already JSON from sakhi_stream_generator
+                try:
+                    data = json.loads(chunk_json)
+                    if data.get("type") == "content":
+                        full_ans += data.get("reply", "")
+                except: pass
+                yield chunk_json
+            
+            # After loop finishes, log to DB
+            if full_ans:
+                await save_sakhi_message_async(user_id, full_ans, detected_lang)
+
+        final_gen = sakhi_stream_generator(stream_iter, intent, metadata)
+        return StreamingResponse(wrap_generator_with_logging(final_gen), media_type="application/x-ndjson")
+
+    # --- NON-STREAMING FLOW (Backward Compatible) ---
+    try:
+        if route == Route.SLM_DIRECT:
+            final_ans = await slm_client.generate_chat(req.message, detected_lang, user_name)
+        elif route == Route.SLM_RAG:
+            context_text = format_hierarchical_context(kb_results)[:1500]
+            final_ans = await slm_client.generate_rag_response(context_text, req.message, detected_lang, user_name)
+        else: # OPENAI_RAG
+            final_ans, _ = await generate_medical_response(req.message, detected_lang, history, user_name, kb_results)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    # Fire-and-forget logging via BackgroundTasks
+    background_tasks.add_task(save_sakhi_message_async, user_id, final_ans, detected_lang)
+
+    return {
         "intent": intent,
-        "reply": final_ans, 
-        "mode": "medical", 
+        "reply": final_ans,
+        "mode": metadata["mode"],
         "language": detected_lang,
-        "youtube_link": youtube_link,
-        "infographic_url": infographic_url,
-        "route": "openai_rag"
+        "route": route.value,
+        "youtube_link": metadata["youtube_link"],
+        "infographic_url": metadata["infographic_url"]
     }
-    print(f"Response Payload: {response_payload}")
-    return response_payload
 
 
 @app.post("/user/answers")

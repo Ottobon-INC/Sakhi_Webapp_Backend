@@ -1,4 +1,5 @@
 # modules/user_profile.py
+import asyncio
 import re
 
 from supabase_client import (
@@ -180,3 +181,12 @@ def login_user(email: str, password: str):
     
     # Authentication successful
     return user
+
+
+# =========================================================================
+# ASYNC WRAPPERS — for use inside asyncio.gather (non-blocking)
+# =========================================================================
+
+async def get_user_profile_async(user_id: str):
+    """Non-blocking wrapper around get_user_profile."""
+    return await asyncio.to_thread(get_user_profile, user_id)

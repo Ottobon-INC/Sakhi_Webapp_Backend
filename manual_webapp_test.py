@@ -36,7 +36,7 @@ async def main():
                 # Clear the "Waiting" line
                 print("\r" + " " * 40 + "\r", end="", flush=True)
 
-                latency_ms = (end_time - start_time) * 1000
+                latency_sec = end_time - start_time
                 
                 if response.status_code == 200:
                     data = response.json()
@@ -44,7 +44,7 @@ async def main():
                     route = data.get("route", "N/A")
                     intent = data.get("intent", "N/A")
                     
-                    print(f"✅ Response Received in {latency_ms:.2f}ms")
+                    print(f"✅ Response Received in {latency_sec:.2f}s")
                     print(f"👉 Route: {route}")
                     print(f"👉 Intent: {intent}")
                     print(f"💬 Answer: {message}")

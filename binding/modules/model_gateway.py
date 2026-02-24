@@ -1,4 +1,5 @@
 # modules/model_gateway.py
+import asyncio
 import logging
 from enum import Enum
 from typing import List
@@ -243,9 +244,11 @@ class ModelGateway:
     ]
     
     # Similarity thresholds for routing decisions
-    SMALL_TALK_THRESHOLD = 0.75  # High confidence needed for small talk
-    MEDICAL_SIMPLE_THRESHOLD = 0.65  # Moderate confidence for simple medical
-    FACILITY_INFO_THRESHOLD = 0.50  # Lower threshold for facility/location queries to catch more
+    SMALL_TALK_THRESHOLD = 0.75       # High confidence needed for small talk
+    MEDICAL_SIMPLE_THRESHOLD = 0.60   # Moderate confidence for simple medical
+    FACILITY_INFO_THRESHOLD = 0.50    # Lower threshold for facility/location queries
+    MEDICAL_COMPLEX_THRESHOLD = 0.65  # Minimum score to even consider complex routing
+    COMPLEX_MARGIN = 0.05             # Complex must beat simple by this margin to go to OpenAI
     
     def __init__(self):
         """Initialize the gateway by computing anchor vectors."""
@@ -302,56 +305,56 @@ class ModelGateway:
         
         return dot_product / (norm1 * norm2)
     
-    def decide_route(self, user_text: str) -> Route:
-        """
-        Determine the appropriate route for a user query based on semantic similarity.
-        
-        Args:
-            user_text: User's input message
-            
-        Returns:
-            Route enum indicating which model to use
-        """
-        # Generate embedding for user input
+    def decide_route_sync(self, user_text: str) -> Route:
+        """Synchronous version kept for backward compatibility."""
         user_vector = np.array(generate_embedding(user_text))
         
-        # Calculate similarities to each anchor
         small_talk_sim = self._cosine_similarity(user_vector, self.small_talk_anchor)
         medical_simple_sim = self._cosine_similarity(user_vector, self.medical_simple_anchor)
         medical_complex_sim = self._cosine_similarity(user_vector, self.medical_complex_anchor)
         facility_info_sim = self._cosine_similarity(user_vector, self.facility_info_anchor)
         
-        # Log similarity scores for debugging
         logger.info(f"Query: '{user_text[:50]}...'")
         logger.info(f"Similarity scores - Small Talk: {small_talk_sim:.3f}, "
                    f"Medical Simple: {medical_simple_sim:.3f}, "
                    f"Medical Complex: {medical_complex_sim:.3f}, "
                    f"Facility Info: {facility_info_sim:.3f}")
         
-        # Routing logic based on thresholds and highest similarity
+        # 1. Small talk
         if small_talk_sim >= self.SMALL_TALK_THRESHOLD:
             logger.info(f"→ Routing to: SLM_DIRECT (small talk detected)")
             return Route.SLM_DIRECT
         
-        # Check for facility/location queries FIRST - route to SLM since it has this info
-        # This takes priority over medical queries to ensure clinic info is retrieved
+        # 2. Facility/clinic info
         if facility_info_sim >= self.FACILITY_INFO_THRESHOLD:
             logger.info(f"→ Routing to: SLM_RAG (facility/location info query)")
             return Route.SLM_RAG
         
-        # Only check medical queries if it's not a facility query
-        if medical_complex_sim >= medical_simple_sim:
-            # Complex medical or default to safest option
-            logger.info(f"→ Routing to: OPENAI_RAG (complex medical or default)")
+        # 3. Complex medical — ONLY if score is high AND clearly beats simple
+        if (medical_complex_sim >= self.MEDICAL_COMPLEX_THRESHOLD and
+                medical_complex_sim >= medical_simple_sim + self.COMPLEX_MARGIN):
+            logger.info(f"→ Routing to: OPENAI_RAG (complex medical confirmed)")
             return Route.OPENAI_RAG
         
+        # 4. Simple medical
         if medical_simple_sim >= self.MEDICAL_SIMPLE_THRESHOLD:
             logger.info(f"→ Routing to: SLM_RAG (simple medical query)")
             return Route.SLM_RAG
         
-        # Default to OpenAI for safety when confidence is low
-        logger.info(f"→ Routing to: OPENAI_RAG (low confidence, defaulting to safe option)")
-        return Route.OPENAI_RAG
+        # 5. Default fallback — SLM_RAG (not OpenAI)
+        logger.info(f"→ Routing to: SLM_RAG (default fallback)")
+        return Route.SLM_RAG
+
+    def decide_route(self, user_text: str) -> Route:
+        """Synchronous wrapper kept for backward compatibility."""
+        return self.decide_route_sync(user_text)
+
+    async def decide_route_async(self, user_text: str) -> Route:
+        """
+        Async version — runs the blocking embedding call in a thread pool
+        so the FastAPI event loop is never blocked.
+        """
+        return await asyncio.to_thread(self.decide_route_sync, user_text)
     
     def get_intent_description(self, user_text: str, route: Route) -> str:
         """

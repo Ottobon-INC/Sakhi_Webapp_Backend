@@ -1,14 +1,11 @@
-from typing import List, Dict, Any
-from supabase_client import supabase_rpc
-from rag import generate_embedding
+from typing import List, Dict, Any, Optional
+from supabase_client import supabase_rpc, async_supabase_rpc
+from rag import generate_embedding, async_generate_embedding
+import asyncio
 
 def hierarchical_rag_query(user_question: str, match_threshold: float = 0.3, match_count: int = 4) -> List[Dict[str, Any]]:
     """
-    Performs a hierarchical search:
-    1. Embeds the user question.
-    2. Searches 'section_chunks' for matches (Hierarchical) -> Primary Source for Answer.
-    3. Searches 'faq' table for matches (FAQ) -> Primary Source for YouTube Link.
-    4. Merges and returns results.
+    Sync version — kept for backward compatibility.
     """
     print(f"Querying: {user_question}...")
     
@@ -35,8 +32,6 @@ def hierarchical_rag_query(user_question: str, match_threshold: float = 0.3, mat
         print(f"Hierarchical search failed: {e}")
 
     # B. Search FAQ (For YouTube Link)
-    # We only need the top match to find a relevant video
-    # match_faq likely only accepts query_embedding and match_count
     faq_params = {
         "query_embedding": query_vector,
         "match_count": 1
@@ -46,16 +41,70 @@ def hierarchical_rag_query(user_question: str, match_threshold: float = 0.3, mat
         faq_results = supabase_rpc("match_faq", faq_params)
         if faq_results:
             for item in faq_results:
-                # Only add if it has a YouTube link or if we have no other results
                 if item.get("youtube_link") or not merged_results:
                     item["source_type"] = "FAQ"
-                    # Ensure infographic_url is preserved if present
                     if "infographic_url" not in item:
                         item["infographic_url"] = None 
-
                     merged_results.append(item)
     except Exception as e:
         print(f"FAQ search failed: {e}")
+    
+    return merged_results
+
+
+async def async_hierarchical_rag_query(user_question: str, match_threshold: float = 0.3, match_count: int = 4, query_vector: Optional[list[float]] = None) -> List[Dict[str, Any]]:
+    """
+    Native async version — uses async embedding + async DB calls.
+    No thread pool, true non-blocking I/O.
+    """
+    print(f"Querying (async): {user_question}...")
+    
+    # 1. Embed user query (async) if not provided
+    if query_vector is None:
+        query_vector = await async_generate_embedding(user_question)
+    
+    # 2. Call Supabase RPC functions (async) in parallel
+    params = {
+        "query_embedding": query_vector,
+        "match_threshold": match_threshold,
+        "match_count": match_count
+    }
+    
+    faq_params = {
+        "query_embedding": query_vector,
+        "match_count": 1
+    }
+    
+    # Parallelize the two database searches
+    results_list = await asyncio.gather(
+        async_supabase_rpc("hierarchical_search", params),
+        async_supabase_rpc("match_faq", faq_params),
+        return_exceptions=True
+    )
+    
+    doc_results = results_list[0]
+    faq_results = results_list[1]
+    
+    merged_results = []
+
+    # A. Process Hierarchical Docs
+    if not isinstance(doc_results, Exception) and doc_results:
+        for item in doc_results:
+            item["source_type"] = "DOCUMENT"
+            merged_results.append(item)
+    elif isinstance(doc_results, Exception):
+        print(f"Hierarchical search failed: {doc_results}")
+
+    # B. Process FAQ
+    if not isinstance(faq_results, Exception) and faq_results:
+        for item in faq_results:
+            if item.get("youtube_link") or not merged_results:
+                item["source_type"] = "FAQ"
+                if "infographic_url" not in item:
+                    item["infographic_url"] = None 
+                merged_results.append(item)
+    elif isinstance(faq_results, Exception):
+        print(f"FAQ search failed: {faq_results}")
     
     return merged_results
 

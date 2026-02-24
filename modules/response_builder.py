@@ -1,51 +1,125 @@
 # modules/response_builder.py
 import os
+import asyncio
 from typing import List, Optional, Dict, Tuple
 
 import supabase_client  # ensures .env is loaded once
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 
 from modules.rag_search import add_kb_entry
 from modules.text_utils import truncate_response
 # Import from root (assuming running from main.py)
-from search_hierarchical import hierarchical_rag_query, format_hierarchical_context
+from search_hierarchical import hierarchical_rag_query, async_hierarchical_rag_query, format_hierarchical_context
 
 _api_key = os.getenv("OPENAI_API_KEY")
 client = None
+async_client = None
 if _api_key:
     client = OpenAI(api_key=_api_key)
+    async_client = AsyncOpenAI(api_key=_api_key)
 
-# Classifier system prompt (must be exact)
-CLASSIFIER_PROMPT = """
-You are a Digital South Indian Nurse Chatbot.
+import re
 
-Your task:
-1. Detect the language of the user's message. The input may be:
-   - Telugu
-   - English
-   - Tinglish (Telugu written in Roman alphabet)
+# Rule-based detection for extreme latency optimization
+CRITICAL_KEYWORDS = [
+    "pain", "bleeding", "emergency", "accident", "broken", "severe", "worst", 
+    "suicide", "hurt", "die", "kill", "hospital", "doctor", "ambulance",
+    "not moving", "sharp", "cramp", "fever", "vision", "headache"
+]
 
-2. Translate the message internally into English for analysis, but always respond in the user’s identified language.
+MEDICAL_TOPICS = [
+    "ivf", "iui", "icsi", "pcos", "pcod", "fertility", "pregnant", "pregnancy",
+    "egg freezing", "sperm freezing", "embryo freezing", "laparoscopy", "hysteroscopy",
+    "surrogacy", "c-section", "natural birth", "postpartum"
+]
 
-3. Check if the user’s question clearly relates to any of these topics:
-   IVF, Fertility, Parenthood, Pregnancy, Ovulation, Infertility,
-   IUI, Treatment cost, Success rate, Finance, Clinics, Doctors.
+def detect_language_rule_based(text: str) -> str:
+    """Fast heuristic for language detection."""
+    # Check for Telugu characters
+    if re.search(r"[\u0c00-\u0c7f]", text):
+        return "telugu"
+    # Basic check for Tinglish (Telugu in Roman script) - very simplified
+    # This is a placeholder; a real implementation might use more complex patterns
+    tinglish_patterns = ["namaste", "ela", "unnaru", "cheppu", "enti", "ledu"]
+    if any(p in text.lower() for p in tinglish_patterns):
+        return "tinglish"
+    return "en"
 
-4. Output MUST include ONLY:
+def get_signal_rule_based(text: str) -> str:
+    """Keyword-based critical signal detection."""
+    text_low = text.lower()
+    if any(k in text_low for k in CRITICAL_KEYWORDS):
+        return "YES"
+    return "NO"
 
-Identified Language: <language>
+def get_intent_rule_based(text: str) -> str:
+    """Generate intent locally based on keywords."""
+    text_low = text.lower()
+    if any(k in text_low for k in ["hi", "hello", "hey"]):
+        return "We're so glad you're here — this is a safe space where you can ask anything."
+    if any(t in text_low for t in ["thank", "thanks"]):
+        return "We're touched by your gratitude, and we're always here whenever you need support."
+    for topic in MEDICAL_TOPICS:
+        if topic in text_low:
+            return f"We're here to gently guide you through understanding {topic.upper()} with care."
+    return "We're here to support you with care and understanding — you're in a safe space."
 
-General Output:
-[SIGNAL]: YES or NO
-"""
-
-
-def classify_message(message: str) -> Dict[str, str]:
+async def get_metadata_async(message: str) -> Dict[str, str]:
     """
-    Run the classifier prompt and parse out language and signal.
+    Optimized metadata generator:
+    1. Runs rule-based detection first (~0ms).
+    2. Only calls OpenAI for translation if language != English (~1.5s).
+    3. If English, returns immediately, saving 1.5s.
     """
+    lang = detect_language_rule_based(message)
+    signal = get_signal_rule_based(message)
+    intent = get_intent_rule_based(message)
+    
+    # If it's plain English, we skip OpenAI entirely for metadata
+    if lang == "en":
+        return {
+            "language": "en",
+            "signal": signal,
+            "intent": intent,
+            "translation": message
+        }
+
+    # If non-English, we still need the AI for a quality translation
+    if not async_client:
+        return {"language": lang, "signal": signal, "intent": intent, "translation": message}
+
+    try:
+        # We only ask for translation now, which is faster and more focused
+        completion = await async_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Translate to plain English. Output ONLY the translation."},
+                {"role": "user", "content": message},
+            ],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        translation = completion.choices[0].message.content.strip()
+        
+        return {
+            "language": lang,
+            "signal": signal,
+            "intent": intent,
+            "translation": translation
+        }
+    except Exception as e:
+        print(f"Metadata/Translation error: {e}")
+        return {
+            "language": lang,
+            "signal": signal,
+            "intent": intent,
+            "translation": message
+        }
+
+
+def _classify_message_sync(message: str) -> Dict[str, str]:
+    """Internal sync classifier."""
     if not client:
-        # Default fallback if OpenAI is missing
         return {"language": "en", "signal": "NO"}
 
     completion = client.chat.completions.create(
@@ -76,6 +150,50 @@ def classify_message(message: str) -> Dict[str, str]:
         "language": language or "en",
         "signal": signal or "NO",
     }
+
+
+def classify_message(message: str) -> Dict[str, str]:
+    """Synchronous wrapper kept for backward compatibility."""
+    return _classify_message_sync(message)
+
+
+async def classify_message_async(message: str) -> Dict[str, str]:
+    """Native async version — uses AsyncOpenAI directly, no thread pool."""
+    if not async_client:
+        return {"language": "en", "signal": "NO"}
+
+    try:
+        completion = await async_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": CLASSIFIER_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            temperature=0.2,
+        )
+
+        content = completion.choices[0].message.content
+        language = ""
+        signal = ""
+
+        for line in content.splitlines():
+            low = line.lower()
+            if low.startswith("identified language"):
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    language = parts[1].strip()
+            elif "[signal]" in low:
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    signal = parts[1].strip().upper()
+
+        return {
+            "language": language or "en",
+            "signal": signal or "NO",
+        }
+    except Exception as e:
+        print(f"Classification error: {e}")
+        return {"language": "en", "signal": "NO"}
 
 
 def _friendly_name(name: Optional[str]) -> Optional[str]:
@@ -158,18 +276,21 @@ def generate_smalltalk_response(
     return final_text
 
 
-def generate_medical_response(
+async def generate_medical_response(
     prompt: str,
     target_lang: str,
     history: Optional[List[Dict[str, str]]],
     user_name: Optional[str] = None,
+    kb_results: Optional[List[dict]] = None,
 ) -> Tuple[str, List[dict]]:
     """
-    Medical path: RAG + history.
+    Medical path: RAG + history. (ASYNC — native non-blocking I/O)
     Returns (final_text, kb_results)
     """
-    # Use Hierarchical RAG
-    kb_results = hierarchical_rag_query(prompt)
+    # Use pre-fetched RAG results if available, otherwise fetch now
+    if kb_results is None:
+        kb_results = await async_hierarchical_rag_query(prompt)
+    
     context_text = format_hierarchical_context(kb_results)
     
     history_block = _build_history_block(history)
@@ -226,10 +347,10 @@ def generate_medical_response(
             "\nState clearly that advice is general and suggest consulting a doctor for specifics."
         )
 
-    if not client:
+    if not async_client:
         return "I understand your concern. Since my medical brain is currently offline (Missing API Key), I recommend consulting a doctor for specific guidance.", []
 
-    completion = client.chat.completions.create(
+    completion = await async_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": system_content},
@@ -265,20 +386,10 @@ Based on the patient's question, generate a single warm, empathetic sentence tha
 IMPORTANT: Output ONLY the intent sentence, nothing else. No quotes, no labels, just the sentence."""
 
 
-def generate_intent(query: str) -> str:
-    """
-    Dynamically generate a warm, empathetic, patient-facing intent description
-    using OpenAI based on the patient's query.
-    
-    Args:
-        query: The patient's message/question
-        
-    Returns:
-        A single warm, empathetic intent sentence
-    """
+def _generate_intent_sync(query: str) -> str:
+    """Internal sync intent generator."""
     if not client:
         return "We're here to support you with care and understanding — you're in a safe space."
-
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -289,12 +400,63 @@ def generate_intent(query: str) -> str:
             temperature=0.7,
             max_tokens=100,
         )
-        
         intent = completion.choices[0].message.content.strip()
-        # Remove any quotes if present
         intent = intent.strip('"\'')
         return intent
-        
-    except Exception as e:
-        # Fallback intent if generation fails
+    except Exception:
         return "We're here to support you with care and understanding — you're in a safe space."
+
+
+def generate_intent(query: str) -> str:
+    """Synchronous wrapper kept for backward compatibility."""
+    return _generate_intent_sync(query)
+
+
+async def generate_intent_async(query: str) -> str:
+    """Native async version — uses AsyncOpenAI directly, no thread pool."""
+    if not async_client:
+        return "We're here to support you with care and understanding — you're in a safe space."
+    try:
+        completion = await async_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": INTENT_GENERATOR_PROMPT},
+                {"role": "user", "content": f"Patient's question: {query}"},
+            ],
+            temperature=0.7,
+            max_tokens=100,
+        )
+        intent = completion.choices[0].message.content.strip()
+        intent = intent.strip('"\'')
+        return intent
+    except Exception:
+        return "We're here to support you with care and understanding — you're in a safe space."
+
+
+async def translate_to_english_async(text: str) -> str:
+    """
+    Translate user query to English for better internal routing and search.
+    Only translates if input is likely non-English or mixed.
+    """
+    if not async_client:
+        return text
+
+    try:
+        # Detect if it's already plain English (simple heuristic)
+        # If it's mostly ASCII and no obvious non-English scripts, we might skip,
+        # but for routing accuracy, a quick translate call is safer.
+        
+        completion = await async_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Translate the following user message to plain English for internal technical processing. Output ONLY the translation."},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=150,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return text
+

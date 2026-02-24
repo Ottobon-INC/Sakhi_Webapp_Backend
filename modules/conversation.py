@@ -1,4 +1,5 @@
 # modules/conversation.py
+import asyncio
 from datetime import datetime
 import uuid
 
@@ -55,3 +56,23 @@ def get_last_messages(user_id: str, limit: int = 5):
         history.append({"role": role, "content": r.get("message_text", "")})
 
     return history
+
+
+# =========================================================================
+# ASYNC WRAPPERS — for use inside asyncio.gather (non-blocking)
+# =========================================================================
+
+async def save_user_message_async(user_id: str, text: str, lang: str = "en"):
+    """Non-blocking wrapper around save_user_message."""
+    return await asyncio.to_thread(save_user_message, user_id, text, lang)
+
+
+async def save_sakhi_message_async(user_id: str, text: str, lang: str = "en"):
+    """Non-blocking wrapper around save_sakhi_message."""
+    return await asyncio.to_thread(save_sakhi_message, user_id, text, lang)
+
+
+async def get_last_messages_async(user_id: str, limit: int = 5):
+    """Non-blocking wrapper around get_last_messages."""
+    return await asyncio.to_thread(get_last_messages, user_id, limit)
+
