@@ -1,5 +1,6 @@
 # modules/user_profile.py
 import re
+import os
 
 from supabase_client import (
     generate_user_id,
@@ -7,6 +8,7 @@ from supabase_client import (
     supabase_select,
     supabase_update,
 )
+from modules.auth import hash_password, verify_password, is_already_hashed
 
 
 def _normalize_phone(phone: str | None) -> str | None:
@@ -31,10 +33,10 @@ def create_user(
     relation: str | None = None,
 ):
     """
-    Insert a user into the 'sakhi_users' table and return the inserted row.
+    Insert a user into the 'sakhi_users' table with a bcrypt-hashed password.
+    Returns the inserted row.
     """
     user_id = generate_user_id()
-
     norm_phone = _normalize_phone(phone_number)
 
     data = {
@@ -42,12 +44,11 @@ def create_user(
         "name": name,
         "email": email,
         "phone_number": norm_phone,
-        # Store as password_hash column expected by Supabase schema.
-        # (Consider hashing before storing in production.)
-        "password_hash": password,
+        "password_hash": hash_password(password),   # <-- bcrypt hash
         "role": role,
         "preferred_language": preferred_language,
         "relation_to_patient": relation,
+        "auth_provider": "email",
     }
 
     inserted = supabase_insert("sakhi_users", data)
@@ -56,6 +57,59 @@ def create_user(
     if isinstance(inserted, dict):
         return inserted
     raise Exception("Unexpected response while creating user")
+
+
+def create_google_user(
+    email: str,
+    name: str,
+    google_id: str,
+    profile_picture: str | None = None,
+    preferred_language: str | None = None,
+):
+    """
+    Create a user that authenticated via Google OAuth.
+    No password is stored.
+    Returns the inserted row.
+    """
+    user_id = generate_user_id()
+
+    data = {
+        "user_id": user_id,
+        "name": name,
+        "email": email,
+        "google_id": google_id,
+        "profile_picture": profile_picture,
+        "role": "USER",
+        "preferred_language": preferred_language or "en",
+        "auth_provider": "google",
+    }
+
+    inserted = supabase_insert("sakhi_users", data)
+    if isinstance(inserted, list) and inserted:
+        return inserted[0]
+    if isinstance(inserted, dict):
+        return inserted
+    raise Exception("Unexpected response while creating Google user")
+
+
+def get_user_by_email(email: str):
+    """Fetch user by email address."""
+    if not email:
+        return None
+    rows = supabase_select("sakhi_users", select="*", filters=f"email=eq.{email}")
+    if rows and isinstance(rows, list) and rows:
+        return rows[0]
+    return None
+
+
+def get_user_by_google_id(google_id: str):
+    """Fetch user by Google ID."""
+    if not google_id:
+        return None
+    rows = supabase_select("sakhi_users", select="*", filters=f"google_id=eq.{google_id}")
+    if rows and isinstance(rows, list) and rows:
+        return rows[0]
+    return None
 
 
 def update_relation(user_id: str, relation: str):
@@ -77,9 +131,7 @@ def update_preferred_language(user_id: str, preferred_language: str):
 
 
 def get_user_profile(user_id: str):
-    """
-    Fetch complete user profile.
-    """
+    """Fetch complete user profile."""
     rows = supabase_select("sakhi_users", select="*", filters=f"user_id=eq.{user_id}")
 
     if not rows or not isinstance(rows, list):
@@ -89,15 +141,12 @@ def get_user_profile(user_id: str):
 
 
 def get_user_by_phone(phone_number: str):
-    """
-    Fetch user by phone_number (or phone).
-    """
+    """Fetch user by phone_number."""
     if not phone_number:
         return None
     norm = _normalize_phone(phone_number)
     if not norm:
         return None
-    # try phone_number first
     rows = supabase_select("sakhi_users", select="*", filters=f"phone_number=eq.{norm}")
     if rows and isinstance(rows, list) and rows:
         return rows[0]
@@ -112,19 +161,17 @@ def resolve_user_id_by_phone(phone_number: str) -> str | None:
 
 
 def create_partial_user(phone_number: str):
-    """
-    Create a minimal user record with just phone number to start onboarding.
-    """
+    """Create a minimal user record with just phone number to start onboarding."""
     user_id = generate_user_id()
     norm_phone = _normalize_phone(phone_number)
-    
+
     data = {
         "user_id": user_id,
         "phone_number": norm_phone,
         "role": "USER",
+        "auth_provider": "phone",
     }
-    
-    # insert
+
     inserted = supabase_insert("sakhi_users", data)
     if isinstance(inserted, list) and inserted:
         return inserted[0]
@@ -132,13 +179,12 @@ def create_partial_user(phone_number: str):
         return inserted
     return data
 
+
 def update_user_profile(user_id: str, updates: dict):
-    """
-    Update specific fields in user profile.
-    """
+    """Update specific fields in user profile."""
     if not user_id:
         raise ValueError("user_id is required")
-    
+
     match = f"user_id=eq.{user_id}"
     return supabase_update("sakhi_users", match, updates)
 
@@ -146,37 +192,42 @@ def update_user_profile(user_id: str, updates: dict):
 def login_user(email: str, password: str):
     """
     Authenticate user by email and password.
-    Returns user profile if credentials are valid, None otherwise.
-    
-    Args:
-        email: User's email address
-        password: User's password
-        
-    Returns:
-        User profile dict if successful, None if authentication fails
-        
-    Raises:
-        ValueError: If email or password is missing
+    Handles both legacy plain-text and new bcrypt-hashed passwords.
+    Returns user profile dict if successful, None otherwise.
     """
     if not email:
         raise ValueError("email is required")
     if not password:
         raise ValueError("password is required")
-    
+
     # Fetch user by email
     rows = supabase_select("sakhi_users", select="*", filters=f"email=eq.{email}")
-    
+
     if not rows or not isinstance(rows, list) or len(rows) == 0:
         return None
-    
+
     user = rows[0]
-    
-    # Check password (in production, use proper password hashing like bcrypt)
-    # Currently storing as plain text in password_hash column
+
+    # Block Google-only users from password login
+    if user.get("auth_provider") == "google" and not user.get("password_hash"):
+        raise ValueError("This account uses Google sign-in. Please sign in with Google.")
+
     stored_password = user.get("password_hash")
-    
-    if stored_password != password:
+    if not stored_password:
         return None
-    
-    # Authentication successful
+
+    # Handle legacy plain-text passwords gracefully
+    if is_already_hashed(stored_password):
+        if not verify_password(password, stored_password):
+            return None
+    else:
+        # Legacy plain-text comparison
+        if stored_password.strip() != password:
+            return None
+        # Upgrade to bcrypt hash silently
+        try:
+            update_user_profile(user["user_id"], {"password_hash": hash_password(password)})
+        except Exception:
+            pass  # Don't block login if upgrade fails
+
     return user

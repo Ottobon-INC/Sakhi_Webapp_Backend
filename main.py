@@ -6,18 +6,23 @@ from uuid import UUID
 from enum import Enum
 from datetime import datetime
 import uuid as uuid_module
+import os
 
 from modules.user_profile import (
     create_user,
     update_preferred_language,
-    update_relation, 
+    update_relation,
     get_user_profile,
     resolve_user_id_by_phone,
     get_user_by_phone,
     create_partial_user,
     update_user_profile,
     login_user,
+    create_google_user,
+    get_user_by_email,
+    get_user_by_google_id,
 )
+from modules.auth import create_access_token, save_session, invalidate_session, decode_access_token
 from modules.response_builder import (
     classify_message,
     generate_medical_response,
@@ -117,6 +122,18 @@ class JourneyUpdateRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+# Google OAuth model
+class GoogleOAuthRequest(BaseModel):
+    google_token: str  # ID token from Google Identity Services
+
+
+# Tool Usage model
+class ToolUsageRequest(BaseModel):
+    user_id: str
+    tool_name: str           # e.g. 'ovulation_calculator', 'due_date_calculator'
+    tool_data: dict = {}     # inputs/outputs of the tool
 
 
 # ================== KNOWLEDGE HUB MODELS ==================
@@ -221,35 +238,317 @@ def register_user(req: RegisterRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     user_id = user_row.get("user_id")
+    access_token = create_access_token(
+        user_id=user_id,
+        email=user_row.get("email", ""),
+        name=user_row.get("name", ""),
+    )
 
-    return {"status": "success", "user_id": user_id, "user": user_row}
+    # Save session to database (stateful JWT)
+    try:
+        save_session(user_id, access_token)
+    except Exception:
+        pass  # Don't block registration if session save fails
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": user_row,
+    }
 
 
 @app.post("/user/login")
 def login(req: LoginRequest):
     """
     Authenticate user with email and password.
-    Returns user profile if credentials are valid.
+    Returns user profile + JWT access token if credentials are valid.
     """
     if not req.email or not req.password:
         raise HTTPException(status_code=400, detail="email and password are required")
-    
+
     try:
         user = login_user(req.email, req.password)
-        
+
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        
+
+        access_token = create_access_token(
+            user_id=user.get("user_id"),
+            email=user.get("email", ""),
+            name=user.get("name", ""),
+        )
+
+        # Save session to database (stateful JWT)
+        try:
+            save_session(user.get("user_id"), access_token)
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "user_id": user.get("user_id"),
-            "user": user
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": user,
         }
-        
+
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/auth/google")
+def google_auth_redirect(redirect: str = "/"):
+    """
+    Start the Google OAuth flow.
+    Generates a Google consent URL and redirects the user there.
+    """
+    import urllib.parse
+    import secrets
+
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env"
+        )
+
+    # Callback URL from env (must match Google Console redirect URI)
+    callback_url = os.getenv("GOOGLE_REDIRECT_URI", "")
+    if not callback_url:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth redirect URI not configured. Set GOOGLE_REDIRECT_URI in .env"
+        )
+
+    # Generate a random state for CSRF protection
+    state = secrets.token_urlsafe(32)
+
+    # Build Google OAuth URL
+    params = urllib.parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": callback_url,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "state": state,
+        "prompt": "consent",
+    })
+
+    google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=google_auth_url)
+
+
+@app.get("/auth/google/callback")
+def google_auth_callback(code: str = "", state: str = "", error: str = ""):
+    """
+    Handle the Google OAuth callback.
+    Exchanges the authorization code for user info, creates/finds the user,
+    generates a JWT, and redirects to the frontend with the token.
+    """
+    import urllib.parse
+    import requests as http_requests
+    from fastapi.responses import RedirectResponse
+
+    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5000")
+
+    if error:
+        # User denied consent or an error occurred
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error={error}")
+
+    if not code:
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error=no_code")
+
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    callback_url = os.getenv("GOOGLE_REDIRECT_URI", "")
+
+    try:
+        # Step 1: Exchange the authorization code for tokens
+        token_response = http_requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": callback_url,
+                "grant_type": "authorization_code",
+            },
+        )
+
+        if token_response.status_code != 200:
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error=token_exchange_failed")
+
+        token_data = token_response.json()
+        access_token_google = token_data.get("access_token", "")
+
+        # Step 2: Fetch user info from Google
+        userinfo_response = http_requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {access_token_google}"},
+        )
+
+        if userinfo_response.status_code != 200:
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error=userinfo_failed")
+
+        userinfo = userinfo_response.json()
+        google_id = userinfo.get("sub", "")
+        email = userinfo.get("email", "")
+        name = userinfo.get("name", "")
+        picture = userinfo.get("picture", "")
+
+        if not google_id or not email:
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error=invalid_profile")
+
+        # Step 3: Create or find the user
+        user = get_user_by_google_id(google_id)
+        is_new_user = False
+
+        if not user:
+            user = get_user_by_email(email)
+            if user:
+                # Link Google ID to existing account
+                update_user_profile(user["user_id"], {
+                    "google_id": google_id,
+                    "profile_picture": picture,
+                    "auth_provider": "google",
+                })
+                user = get_user_profile(user["user_id"])
+            else:
+                # Create brand new Google user
+                user = create_google_user(
+                    email=email,
+                    name=name,
+                    google_id=google_id,
+                    profile_picture=picture,
+                )
+                is_new_user = True
+
+        # Step 4: Generate our own JWT access token
+        jwt_token = create_access_token(
+            user_id=user.get("user_id"),
+            email=user.get("email", ""),
+            name=user.get("name", ""),
+        )
+
+        # Save session to database (stateful JWT)
+        try:
+            save_session(user.get("user_id"), jwt_token)
+        except Exception:
+            pass
+
+        # Step 5: Redirect to frontend with token in URL params
+        params = urllib.parse.urlencode({
+            "token": jwt_token,
+            "user_id": user.get("user_id", ""),
+            "name": user.get("name", ""),
+            "email": user.get("email", ""),
+            "is_new_user": "true" if is_new_user else "false",
+            "profile_picture": user.get("profile_picture", ""),
+        })
+
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?{params}")
+
+    except Exception as e:
+        error_msg = urllib.parse.quote(str(e))
+        return RedirectResponse(url=f"{FRONTEND_URL}/auth/callback?error={error_msg}")
+
+
+@app.post("/user/logout")
+def logout_user(req: dict = {}):
+    """
+    Invalidate the current session in the database.
+    Frontend sends the access_token in the request body.
+    """
+    token = req.get("access_token", "")
+    if not token:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    try:
+        invalidate_session(token)
+        return {"status": "success", "message": "Logged out successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user/tool-usage")
+def save_tool_usage(req: ToolUsageRequest):
+    """
+    Save tool interaction data to sakhi_tool_usage table.
+    Links to sakhi_users via user_id.
+    Called when a logged-in user uses any tool on the site.
+    """
+    if not req.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if not req.tool_name:
+        raise HTTPException(status_code=400, detail="tool_name is required")
+
+    try:
+        data = {
+            "user_id": req.user_id,
+            "tool_name": req.tool_name,
+            "tool_data": req.tool_data,
+        }
+        from supabase_client import supabase_insert
+        result = supabase_insert("sakhi_tool_usage", data)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/user/tool-usage/{user_id}")
+def get_tool_usage(user_id: str):
+    """
+    Get all tool usage history for a user from sakhi_tool_usage.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    try:
+        from supabase_client import supabase_select
+        rows = supabase_select(
+            "sakhi_tool_usage",
+            select="*",
+            filters=f"user_id=eq.{user_id}",
+        )
+        return {"status": "success", "data": rows or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/user/journey")
+def save_user_journey(req: JourneyUpdateRequest):
+    """
+    Save or update the user's personalization journey.
+    """
+    if not req.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if not req.stage:
+        raise HTTPException(status_code=400, detail="stage is required")
+
+    try:
+        from supabase_client import supabase_upsert
+        
+        data = {
+            "user_id": req.user_id,
+            "stage": req.stage,
+        }
+        if req.date:
+            data["date"] = req.date
+        if req.date_type:
+            data["date_type"] = req.date_type
+
+        # Upsert uses unique user_id to update existing journey or insert new one
+        result = supabase_upsert("sakhi_user_journeys", data, on_conflict="user_id")
+        return {"status": "success", "data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

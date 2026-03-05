@@ -53,6 +53,17 @@ def supabase_insert(table: str, data: Dict[str, Any]):
     return resp.json()
 
 
+def supabase_upsert(table: str, data: Dict[str, Any], on_conflict: Optional[str] = None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if on_conflict:
+        url += f"?on_conflict={on_conflict}"
+    headers = {**HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"}
+    resp = requests.post(url, headers=headers, json=data)
+    if resp.status_code >= 300:
+        raise Exception(f"Supabase upsert failed: {resp.status_code} - {resp.text}")
+    return resp.json()
+
+
 def supabase_select(
     table: str,
     select: str = "*",
