@@ -35,9 +35,9 @@ HEADERS = {
     "Prefer": "return=representation",
 }
 
-from supabase.lib.client_options import ClientOptions
+from supabase.lib.client_options import SyncClientOptions
 
-opts = ClientOptions().replace(
+opts = SyncClientOptions(
     postgrest_client_timeout=60,  # 60 seconds
     storage_client_timeout=60,
     schema="public",
