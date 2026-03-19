@@ -155,6 +155,24 @@ class KnowledgeHubResponse(BaseModel):
         from_attributes = True
 
 
+# ================== BLOG MODELS ==================
+class BlogResponse(BaseModel):
+    id: str
+    url: str
+    domain: str | None = None
+    title: str
+    description: str | None = None
+    summary: str | None = None
+    hashtags: list[str] | None = None
+    image_url: str | None = None
+    content_images: list[str] | None = None
+    callout_stats: list[str] | None = None
+    created_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
 # ================== SUCCESS STORIES MODELS ==================
 class ShareType(str, Enum):
     NAMED = "named"
@@ -1024,6 +1042,54 @@ def onboarding_complete(req: OnboardingCompleteRequest):
         print(f"[onboarding/complete] Traceback:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ================== BLOG API ROUTES ==================
+@app.get("/api/blogs", response_model=list[BlogResponse], tags=["blogs"])
+@app.get("/api/blogs/", response_model=list[BlogResponse], tags=["blogs"])
+def get_blogs():
+    """Get all external blogs"""
+    from supabase_client import supabase
+    import time
+
+    response = None
+    for i in range(3):
+        try:
+            response = supabase.table("sakhi_blogs").select("*").order("created_at", desc=True).execute()
+            break
+        except Exception as e:
+            if i == 2:
+                print(f"Failed to fetch blogs after 3 attempts: {e}")
+            time.sleep(0.5)
+
+    if not response or not response.data:
+        return []
+
+    items = []
+    for item in response.data:
+        items.append(BlogResponse.model_validate(item))
+        
+    return items
+
+@app.get("/api/blogs/{blog_id}", response_model=BlogResponse, tags=["blogs"])
+def get_blog_by_id(blog_id: str):
+    """Get a specific blog by ID"""
+    from supabase_client import supabase
+    import time
+
+    response = None
+    for i in range(3):
+        try:
+            response = supabase.table("sakhi_blogs").select("*").eq("id", blog_id).execute()
+            break
+        except Exception as e:
+            if i == 2:
+                print(f"Failed to fetch blog {blog_id} after 3 attempts: {e}")
+            time.sleep(0.5)
+
+    if not response or not response.data:
+        raise HTTPException(status_code=404, detail="Blog not found")
+
+    return BlogResponse.model_validate(response.data[0])
 
 # ================== KNOWLEDGE HUB ROUTES ==================
 @app.get("/api/knowledge-hub/", response_model=list[KnowledgeHubResponse], tags=["knowledge-hub"])
