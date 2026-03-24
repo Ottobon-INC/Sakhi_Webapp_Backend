@@ -45,18 +45,19 @@ from modules.tools import router as tools_router
 from supabase_client import get_db_client, close_db_client
 from modules.streaming_utils import sakhi_stream_generator
 from rag import async_generate_embedding
+from modules.control_tower.control_tower_client import get_control_tower_client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # STARTUP: Initialize persistent async DB connection pool
     await get_db_client()
-    print("✅ Async DB pool initialized")
+    print("DONE: Async DB pool initialized")
     yield
     # SHUTDOWN: Gracefully close pools
     await close_db_client()
     await get_slm_client().aclose()
-    print("🔴 Async DB and SLM pools closed")
+    print("DONE: Async DB and SLM pools closed")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -78,12 +79,13 @@ async def log_latency(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
-    print(f"🚀 WEBAPP LATENCY: {process_time:.2f}s | Path: {request.url.path}", flush=True)
+    print(f"WEBAPP LATENCY: {process_time:.2f}s | Path: {request.url.path}", flush=True)
     return response
 
-# Initialize model gateway and SLM client (singleton instances)
+# Initialize model gateway, SLM client, and Control Tower client (singleton instances)
 model_gateway = get_model_gateway()
 slm_client = get_slm_client()
+ct_client = get_control_tower_client()
 
 class RegisterRequest(BaseModel):
     name: str  # full name
@@ -289,7 +291,7 @@ def login(req: LoginRequest):
 
 @app.post("/sakhi/chat")
 async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
-    print(f"📥 Received chat request: user_id={req.user_id}, phone={req.phone_number}, stream={req.stream}", flush=True)
+    print(f"Received chat request: user_id={req.user_id}, phone={req.phone_number}, stream={req.stream}", flush=True)
     # 1. Resolve or Create User
     try:
         if req.user_id:
@@ -298,7 +300,7 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             user = get_user_by_phone(req.phone_number)
     except Exception as e:
         # If it's a UUID format error or similar, treat as user not found
-        print(f"⚠️  User resolution failed for {req.user_id or req.phone_number}: {e}", flush=True)
+        print(f"WARNING: User resolution failed for {req.user_id or req.phone_number}: {e}", flush=True)
         user = None
 
     # If new user, create them (auto-onboarding start)
@@ -308,15 +310,22 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 user = create_partial_user(req.phone_number)
                 # Return Welcome Message
                 return {
-                    "reply": "Welcome to Sakhi! I'm here to support you on your health journey. ❤️ \n Let's get started! What should I call you? (Please type just your name, e.g., Deepthi)",
+                    "reply": "Welcome to Sakhi! I'm here to support you on your health journey.\n Let's get started! What should I call you? (Please type just your name, e.g., Deepthi)",
                     "mode": "onboarding"
                 }
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to register user: {e}")
+                print(f"WARNING: DB Registration failed, using Guest fallback: {e}", flush=True)
+                # FALLBACK: Create a dummy guest user with pre-filled profile to SKIP onboarding
+                user = {
+                    "user_id": f"guest_{req.phone_number[-10:]}", 
+                    "name": "Guest", 
+                    "role": "USER",
+                    "gender": "Unknown",
+                    "location": "Unknown"
+                }
         elif req.user_id:
             # For webapp users who might use email or custom ID, create a guest record
             try:
-                from modules.user_profile import create_partial_user
                 # Reuse creation logic but handle user_id instead of phone
                 from supabase_client import supabase_insert, generate_user_id
                 
@@ -328,17 +337,34 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
                     "user_id": final_id,
                     "email": req.user_id if "@" in req.user_id else None,
                     "role": "USER",
-                    "name": "Guest User"
+                    "name": "Guest User",
+                    "gender": "Unknown",
+                    "location": "Unknown"
                 }
                 supabase_insert("sakhi_users", user)
-                print(f"✅ Created auto-guest for {req.user_id}", flush=True)
+                print(f"Created auto-guest for {req.user_id}", flush=True)
             except Exception as e:
-                print(f"⚠️  Guest creation failed: {e}", flush=True)
-                raise HTTPException(status_code=500, detail="User not found and guest creation failed")
+                print(f"WARNING: Guest creation failed, using Guest fallback: {e}", flush=True)
+                user = {
+                    "user_id": f"guest_{req.user_id[:8]}", 
+                    "name": "Guest User", 
+                    "role": "USER",
+                    "gender": "Unknown",
+                    "location": "Unknown"
+                }
         else:
              raise HTTPException(status_code=400, detail="user_id or phone_number is required")
 
     user_id = user.get("user_id")
+
+    # MIRROR USER MESSAGE TO CONTROL TOWER (Non-blocking)
+    background_tasks.add_task(
+        ct_client.mirror_event,
+        thread_id=user_id, # Using user_id as thread_id for now as Sakhi uses 1:1 threads
+        user_id=user_id,
+        sender_type="user",
+        message=req.message
+    )
 
     # 2. Check Onboarding Status (NULL checks)
     current_name = user.get("name")
@@ -350,7 +376,10 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # STATE 1: WAITING FOR NAME (User sent Name)
     if not current_name:
-        update_user_profile(user_id, {"name": msg})
+        try:
+            update_user_profile(user_id, {"name": msg})
+        except Exception as e:
+            print(f"WARNING: DB Update failed for Guest: {e}", flush=True)
         return {
             "reply": f"Nice to meet you, {msg}! Can you let me know your gender ? (Please reply with 'Male' or 'Female')",
             "mode": "onboarding"
@@ -358,7 +387,10 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # STATE 2: WAITING FOR GENDER (User sent Gender)
     elif not current_gender:
-        update_user_profile(user_id, {"gender": msg})
+        try:
+            update_user_profile(user_id, {"gender": msg})
+        except Exception as e:
+            print(f"WARNING: DB Update failed for Guest: {e}", flush=True)
         return {
             "reply": "Got it. And finally, what's your location (City/Town)? (e.g., Vizag)",
             "mode": "onboarding"
@@ -367,7 +399,10 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     # STATE 3: WAITING FOR LOCATION (User sent Location)
     elif not current_location:
         # Update both keys to be safe
-        update_user_profile(user_id, {"location": msg}) 
+        try:
+            update_user_profile(user_id, {"location": msg}) 
+        except Exception as e:
+            print(f"WARNING: DB Update failed for Guest: {e}", flush=True)
         
         long_intro = (
             "Thank you! Your profile is all set.\n"
@@ -438,7 +473,7 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             user_vector = np.array(await async_generate_embedding(translated_query))
         
         t_phase1 = time.time()
-        print(f"  ⏱️  Phase 1 (Discovery + Meta + Embed): {t_phase1 - t_phase1_start:.2f}s", flush=True)
+        print(f"Phase 1 (Discovery + Meta + Embed): {t_phase1 - t_phase1_start:.2f}s", flush=True)
 
         # PHASE 2: Parallel RAG search + Routing
         # Now that we have the vector, we run RAG and Routing concurrently.
@@ -453,11 +488,11 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # Override route if signal is YES (Critical/Medical)
         if signal == "YES":
             route = Route.OPENAI_RAG
-            print(f"  🚨 SIGNAL YES DETECTED: Forcing route to {route.value}", flush=True)
+            print(f"SIGNAL YES DETECTED: Forcing route to {route.value}", flush=True)
 
         t_phase2 = time.time()
-        print(f"  ⏱️  Phase 2 (RAG + Route): {t_phase2 - t_phase2_start:.2f}s → {route.value}", flush=True)
-        print(f"  🚀 Total Pre-gen Latency: {t_phase2 - t_start:.2f}s", flush=True)
+        print(f"Phase 2 (RAG + Route): {t_phase2 - t_phase2_start:.2f}s -> {route.value}", flush=True)
+        print(f"Total Pre-gen Latency: {t_phase2 - t_start:.2f}s", flush=True)
 
     except Exception as e:
         import traceback
@@ -537,6 +572,14 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             # After loop finishes, log to DB
             if full_ans:
                 await save_sakhi_message_async(user_id, full_ans, detected_lang)
+                # MIRROR AI REPLY TO CONTROL TOWER (Background)
+                background_tasks.add_task(
+                    ct_client.mirror_event,
+                    thread_id=user_id,
+                    user_id=user_id,
+                    sender_type="ai",
+                    message=full_ans
+                )
 
         final_gen = sakhi_stream_generator(stream_iter, intent, metadata)
         return StreamingResponse(wrap_generator_with_logging(final_gen), media_type="application/x-ndjson")
@@ -555,15 +598,34 @@ async def sakhi_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     # Fire-and-forget logging via BackgroundTasks
     background_tasks.add_task(save_sakhi_message_async, user_id, final_ans, detected_lang)
+    
+    # MIRROR AI REPLY TO CONTROL TOWER (Background)
+    background_tasks.add_task(
+        ct_client.mirror_event,
+        thread_id=user_id,
+        user_id=user_id,
+        sender_type="ai",
+        message=final_ans
+    )
+
+    # Append Multimedia URLs to answer text for better user visibility
+    answer_text = final_ans
+    if metadata.get("youtube_link"):
+        answer_text += f"\n\n📺 More info: {metadata['youtube_link']}"
+    if metadata.get("infographic_url"):
+        answer_text += f"\n\n🖼️ Helpful Visual: {metadata['infographic_url']}"
 
     return {
+        "answer": answer_text,
+        "reply": answer_text, # Backward compatibility
+        "youtube_url": metadata.get("youtube_link"),
+        "image_url": metadata.get("infographic_url"),
+        "youtube_link": metadata.get("youtube_link"), # Backward compatibility
+        "infographic_url": metadata.get("infographic_url"), # Backward compatibility
         "intent": intent,
-        "reply": final_ans,
         "mode": metadata["mode"],
         "language": detected_lang,
-        "route": route.value,
-        "youtube_link": metadata["youtube_link"],
-        "infographic_url": metadata["infographic_url"]
+        "route": route.value
     }
 
 
