@@ -122,6 +122,57 @@ SAFETY_ITEMS = [
     { "id": "safe_10", "name": "Retinol/Vitamin A", "category": "Beauty", "status": "AVOID", "note": "High doses can cause birth defects. Switch to Bakuchiol." }
 ]
 
+# ================= BABY PREDICTOR =================
+
+CHINESE_CHART = {
+    18: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    19: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    20: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    21: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    22: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    23: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    24: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    25: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    26: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    27: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    28: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    29: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    30: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    31: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    32: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    33: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    34: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    35: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    36: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    37: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    38: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    39: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    40: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    41: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    42: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    43: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"],
+    44: ["G", "B", "G", "B", "B", "G", "G", "B", "G", "B", "G", "B"],
+    45: ["B", "G", "B", "G", "G", "B", "B", "G", "B", "G", "B", "G"]
+}
+
+class BabyPredictorAnswers(BaseModel):
+    cravings: Optional[str] = None
+    mood: Optional[str] = None
+    sleep: Optional[str] = None
+    sickness: Optional[str] = None
+    glow: Optional[str] = None
+
+class BabyPredictorRequest(BaseModel):
+    age: int
+    month: int
+    answers: Optional[BabyPredictorAnswers] = None
+
+class BabyPredictorResponse(BaseModel):
+    ok: bool
+    prediction: str
+    resultMessage: str
+    disclaimer: str
+
 # ================= MODELS =================
 
 class VaccinationRequest(BaseModel):
@@ -697,4 +748,36 @@ def calculate_baby_cost(req: BabyCostRequest):
         "monthlyTotal": int(monthly_recurring),
         "firstYearTotal": int(first_year),
         "oneTime": int(one_time)
+    }
+
+@router.post("/baby-predictor", response_model=BabyPredictorResponse)
+def get_baby_prediction(req: BabyPredictorRequest):
+    # 1. Base Prediction from Chinese Chart
+    # Age is 18-45, month is 0-11 (Jan-Dec)
+    sanitized_age = max(18, min(45, req.age))
+    sanitized_month = max(0, min(11, req.month))
+    
+    base_result = CHINESE_CHART[sanitized_age][sanitized_month]
+    score = 1 if base_result == "B" else -1
+    
+    # 2. Add Quiz Signals
+    if req.answers:
+        if req.answers.cravings == 'spicy': score += 1
+        if req.answers.cravings == 'sweet': score -= 1
+        if req.answers.mood == 'calm': score += 1
+        if req.answers.mood == 'swings': score -= 1
+        if req.answers.sleep == 'left': score += 1
+        if req.answers.sleep == 'right': score -= 1
+        if req.answers.sickness == 'yes': score -= 1
+        if req.answers.glow == 'yes': score += 1
+        
+    # 3. Final Decision
+    prediction = "Boy" if score >= 0 else "Girl"
+    disclaimer = "This is a fun prediction based on traditional beliefs and is not medically accurate."
+    
+    return {
+        "ok": True,
+        "prediction": prediction,
+        "resultMessage": "Looks like it might be a Boy 👶" if score >= 0 else "Our fun guess says Girl 💖",
+        "disclaimer": disclaimer
     }

@@ -571,6 +571,53 @@ def save_user_journey(req: JourneyUpdateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/user/journey/{user_id}")
+def get_user_journey(user_id: str):
+    """
+    Fetch the user's saved journey stage from the database.
+    Called by the frontend on re-login to restore journey state.
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    try:
+        from supabase_client import supabase_select
+        rows = supabase_select(
+            "sakhi_user_journeys",
+            select="*",
+            filters=f"user_id=eq.{user_id}",
+            limit=1,
+        )
+        if rows and len(rows) > 0:
+            journey = rows[0]
+            return {
+                "stage": journey.get("stage"),
+                "date": journey.get("date"),
+                "date_type": journey.get("date_type"),
+            }
+        return {"journey": None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/journey/timeline/{stage}")
+def get_journey_timeline(stage: str):
+    """
+    Return the complete day-by-day / week-by-week timeline data
+    for a given journey stage (pregnant, ttc, parent).
+    This is the single source of truth — the frontend fetches from here.
+    """
+    from modules.timeline_data import get_timeline_for_stage
+
+    result = get_timeline_for_stage(stage)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown journey stage: '{stage}'. Use 'pregnant', 'ttc', or 'parent'."
+        )
+    return result
+
+
 @app.post("/sakhi/chat")
 async def sakhi_chat(req: ChatRequest):
     # 1. Resolve or Create User
